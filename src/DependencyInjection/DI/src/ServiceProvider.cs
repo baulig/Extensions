@@ -85,6 +85,8 @@ namespace Microsoft.Extensions.DependencyInjection
                 {
                     throw new AggregateException("Some services are not able to be constructed", exceptions.ToArray());
                 }
+
+                throw new InvalidTimeZoneException($"I LIVE ON THE MOON!");
             }
         }
 
