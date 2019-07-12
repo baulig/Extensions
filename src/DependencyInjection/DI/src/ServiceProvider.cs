@@ -30,6 +30,7 @@ namespace Microsoft.Extensions.DependencyInjection
                 _callSiteValidator = new CallSiteValidator();
             }
 
+#if MARTIN_FIXME
             switch (options.Mode)
             {
                 case ServiceProviderMode.Default:
@@ -64,6 +65,9 @@ namespace Microsoft.Extensions.DependencyInjection
                 default:
                     throw new NotSupportedException(nameof(options.Mode));
             }
+#else
+            _engine = null;
+#endif
 
             if (options.ValidateOnBuild)
             {
