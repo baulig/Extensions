@@ -66,7 +66,7 @@ namespace Microsoft.Extensions.DependencyInjection
                     throw new NotSupportedException(nameof(options.Mode));
             }
 #else
-            _engine = null;
+            _engine = new RuntimeServiceProviderEngine(serviceDescriptors, callback);
 #endif
 
             if (options.ValidateOnBuild)
@@ -89,9 +89,9 @@ namespace Microsoft.Extensions.DependencyInjection
                 {
                     throw new AggregateException("Some services are not able to be constructed", exceptions.ToArray());
                 }
-
-                throw new InvalidTimeZoneException($"I LIVE ON THE MOON!");
             }
+
+            // throw new InvalidTimeZoneException($"I LIVE ON THE MOON!");
         }
 
         /// <summary>
