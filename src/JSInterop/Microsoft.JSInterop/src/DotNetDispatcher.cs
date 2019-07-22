@@ -8,9 +8,7 @@ using System.Linq;
 using System.Reflection;
 using System.Runtime.ExceptionServices;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using System.Threading.Tasks;
-using Microsoft.JSInterop.Internal;
 
 namespace Microsoft.JSInterop
 {
@@ -20,6 +18,7 @@ namespace Microsoft.JSInterop
     public static class DotNetDispatcher
     {
         internal const string DotNetObjectRefKey = nameof(DotNetObjectRef<object>.__dotNetObject);
+        private static readonly Type[] EndInvokeParameterTypes = new Type[] { typeof(long), typeof(bool), typeof(JSAsyncCallResult) };
 
         private static readonly ConcurrentDictionary<AssemblyKey, IReadOnlyDictionary<string, (MethodInfo, Type[])>> _cachedMethodsByAssembly
             = new ConcurrentDictionary<AssemblyKey, IReadOnlyDictionary<string, (MethodInfo, Type[])>>();
@@ -51,7 +50,7 @@ namespace Microsoft.JSInterop
                 return null;
             }
 
-            return JsonSerializer.ToString(syncResult, JsonSerializerOptionsProvider.Options);
+            return JsonSerializer.Serialize(syncResult, JsonSerializerOptionsProvider.Options);
         }
 
         /// <summary>
@@ -75,19 +74,20 @@ namespace Microsoft.JSInterop
             // code has to implement its own way of returning async results.
             var jsRuntimeBaseInstance = (JSRuntimeBase)JSRuntime.Current;
 
-            var targetInstance = (object)null;
-            if (dotNetObjectId != default)
-            {
-                targetInstance = DotNetObjectRefManager.Current.FindDotNetObject(dotNetObjectId);
-            }
 
             // Using ExceptionDispatchInfo here throughout because we want to always preserve
             // original stack traces.
             object syncResult = null;
             ExceptionDispatchInfo syncException = null;
+            object targetInstance = null;
 
             try
             {
+                if (dotNetObjectId != default)
+                {
+                    targetInstance = DotNetObjectRefManager.Current.FindDotNetObject(dotNetObjectId);
+                }
+
                 syncResult = InvokeSynchronously(assemblyName, methodIdentifier, targetInstance, argsJson);
             }
             catch (Exception ex)
@@ -103,7 +103,7 @@ namespace Microsoft.JSInterop
             else if (syncException != null)
             {
                 // Threw synchronously, let's respond.
-                jsRuntimeBaseInstance.EndInvokeDotNet(callId, false, syncException);
+                jsRuntimeBaseInstance.EndInvokeDotNet(callId, false, syncException, assemblyName, methodIdentifier, dotNetObjectId);
             }
             else if (syncResult is Task task)
             {
@@ -114,16 +114,17 @@ namespace Microsoft.JSInterop
                     if (t.Exception != null)
                     {
                         var exception = t.Exception.GetBaseException();
-                        jsRuntimeBaseInstance.EndInvokeDotNet(callId, false, ExceptionDispatchInfo.Capture(exception));
+
+                        jsRuntimeBaseInstance.EndInvokeDotNet(callId, false, ExceptionDispatchInfo.Capture(exception), assemblyName, methodIdentifier, dotNetObjectId);
                     }
 
                     var result = TaskGenericsUtil.GetTaskResult(task);
-                    jsRuntimeBaseInstance.EndInvokeDotNet(callId, true, result);
+                    jsRuntimeBaseInstance.EndInvokeDotNet(callId, true, result, assemblyName, methodIdentifier, dotNetObjectId);
                 }, TaskScheduler.Current);
             }
             else
             {
-                jsRuntimeBaseInstance.EndInvokeDotNet(callId, true, syncResult);
+                jsRuntimeBaseInstance.EndInvokeDotNet(callId, true, syncResult, assemblyName, methodIdentifier, dotNetObjectId);
             }
         }
 
@@ -177,9 +178,9 @@ namespace Microsoft.JSInterop
             var shouldDisposeJsonDocument = true;
             try
             {
-                if (jsonDocument.RootElement.Type != JsonValueType.Array)
+                if (jsonDocument.RootElement.ValueKind != JsonValueKind.Array)
                 {
-                    throw new ArgumentException($"Expected a JSON array but got {jsonDocument.RootElement.Type}.");
+                    throw new ArgumentException($"Expected a JSON array but got {jsonDocument.RootElement.ValueKind}.");
                 }
 
                 var suppliedArgsLength = jsonDocument.RootElement.GetArrayLength();
@@ -211,7 +212,7 @@ namespace Microsoft.JSInterop
                     }
                     else
                     {
-                        suppliedArgs[index] = JsonSerializer.Parse(item.GetRawText(), parameterType, JsonSerializerOptionsProvider.Options);
+                        suppliedArgs[index] = JsonSerializer.Deserialize(item.GetRawText(), parameterType, JsonSerializerOptionsProvider.Options);
                     }
 
                     index++;
@@ -236,7 +237,7 @@ namespace Microsoft.JSInterop
                 // Check for incorrect use of DotNetObjectRef<T> at the top level. We know it's
                 // an incorrect use if there's a object that looks like { '__dotNetObject': <some number> },
                 // but we aren't assigning to DotNetObjectRef{T}.
-                return item.Type == JsonValueType.Object &&
+                return item.ValueKind == JsonValueKind.Object &&
                     item.TryGetProperty(DotNetObjectRefKey, out _) &&
                      !typeof(IDotNetObjectRef).IsAssignableFrom(parameterType);
             }
@@ -246,11 +247,31 @@ namespace Microsoft.JSInterop
         /// Receives notification that a call from .NET to JS has finished, marking the
         /// associated <see cref="Task"/> as completed.
         /// </summary>
-        /// <param name="asyncHandle">The identifier for the function invocation.</param>
-        /// <param name="succeeded">A flag to indicate whether the invocation succeeded.</param>
-        /// <param name="result">If <paramref name="succeeded"/> is <c>true</c>, specifies the invocation result. If <paramref name="succeeded"/> is <c>false</c>, gives the <see cref="Exception"/> corresponding to the invocation failure.</param>
-        [JSInvokable(nameof(DotNetDispatcher) + "." + nameof(EndInvoke))]
-        public static void EndInvoke(long asyncHandle, bool succeeded, JSAsyncCallResult result)
+        /// <remarks>
+        /// All exceptions from <see cref="EndInvoke(long, bool, JSAsyncCallResult)"/> are caught
+        /// are delivered via JS interop to the JavaScript side when it requests confirmation, as
+        /// the mechanism to call <see cref="EndInvoke(long, bool, JSAsyncCallResult)"/> relies on
+        /// using JS->.NET interop. This overload is meant for directly triggering completion callbacks
+        /// for .NET -> JS operations without going through JS interop, so the callsite for this
+        /// method is responsible for handling any possible exception generated from the arguments
+        /// passed in as parameters.
+        /// </remarks>
+        /// <param name="arguments">The serialized arguments for the callback completion.</param>
+        /// <exception cref="Exception">
+        /// This method can throw any exception either from the argument received or as a result
+        /// of executing any callback synchronously upon completion.
+        /// </exception>
+        public static void EndInvoke(string arguments)
+        {
+            var parsedArgs = ParseArguments(
+                nameof(EndInvoke),
+                arguments,
+                EndInvokeParameterTypes);
+
+            EndInvoke((long)parsedArgs[0], (bool)parsedArgs[1], (JSAsyncCallResult)parsedArgs[2]);
+        }
+
+        private static void EndInvoke(long asyncHandle, bool succeeded, JSAsyncCallResult result)
             => ((JSRuntimeBase)JSRuntime.Current).EndInvokeJS(asyncHandle, succeeded, result);
 
         /// <summary>
